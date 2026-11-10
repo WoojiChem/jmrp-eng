@@ -156,6 +156,7 @@ document.getElementById("logout").onclick = async () => {
 
 function nav(cur) {
   const links = [["#/", "대시보드", ""], ["#/fu", "오늘 F/U", "fu"], ["#/items", "업무목록", "items"], ["#/priority", "우선순위", "priority"],
+                 ["#/daily", "업무일지", "daily"], ["#/weekly", "주간계획", "weekly"], ["#/meeting", "주간미팅", "meeting"],
                  ["#/new", "+ 업무 등록", "new"]];
   if (isAdmin()) links.push(["#/admin", "관리", "admin"]);
   document.getElementById("nav").innerHTML = links.map(([h, t, k]) =>
@@ -187,6 +188,11 @@ async function route() {
     else if (top === "admin" && parts[1] === "master") await viewMaster();
     else if (top === "admin") await viewUsers();
     else if (top === "pw") viewPassword();
+    else if (top === "daily" && parts[1] === "report") await viewDailyReport(q);
+    else if (top === "daily" && parts[1] === "month") await viewDailyMonth(q);
+    else if (top === "daily") await viewDaily(q);
+    else if (top === "weekly") await viewWeekly(q);
+    else if (top === "meeting") await viewMeeting(q);
     else location.hash = "#/";
   } catch (e) {
     if (e.message) $main.innerHTML = `<div class="flash error">${esc(e.message)}</div><p><a href="#/">대시보드로</a></p>`;
@@ -308,7 +314,7 @@ async function viewItems(q) {
   const chips = [["open", "진행 중"], ["all", "전체"], ...STATUSES.map((s) => [s, s])].map(([v, t]) =>
     `<a class="chip ${f.status === v ? "on" : ""}" href="${link({ status: v })}">${esc(t)}</a>`).join("");
   $main.innerHTML = `
-    <h1>업무목록 <span class="sub">${rows.length}건 / 전체 ${r.items.length}건</span></h1>
+    <h1>업무목록 <span class="sub">${rows.length}건 / 전체 ${r.items.length}건</span> <button class="btn sm light" id="b-xls">엑셀</button></h1>
     <div class="card">
       <form class="filters" id="f-filter">
         <div><label>담당</label><select name="owner">${opts([{ v: "me", t: "내 업무" }, ...users().map((u) => ({ v: u.id, t: u.name }))], f.owner, "전체")}</select></div>
@@ -340,6 +346,8 @@ async function viewItems(q) {
     location.hash = link({ ...g });
   };
   document.querySelectorAll("#f-filter select").forEach((s) => { s.onchange = () => s.form.requestSubmit(); });
+  document.getElementById("b-xls").onclick = () => saveXlsx(`공무팀_업무목록_${B.today.replace(/-/g, "")}.xlsx`,
+    [{ name: "업무목록", head: ITEM_HEAD, rows: itemRows(rows), widths: ITEM_W }]);
 }
 
 // ── 우선순위 ────────────────────────────────────────────────────────
@@ -464,7 +472,7 @@ async function uploadPhotos(itemId, files, meta, progEl) {
       if (f.size > 25 * 1024 * 1024) throw new Error(`${f.name}: 사진 1장은 25MB 이하만 올릴 수 있습니다.`);
       const img = await decode(f);
       const big = shrink(img, 1600, 0.85), th = shrink(img, 400, 0.8);
-      await call("photo", { item_id: itemId, comment_id: meta.comment_id || null, kind: meta.kind, caption: meta.caption || null,
+      await call("photo", { item_id: itemId, comment_id: meta.comment_id || null, daily_id: meta.daily_id || null, kind: meta.kind, caption: meta.caption || null,
                             taken_date: meta.taken_date || null, image: big.data, thumb: th.data, width: big.w, height: big.h,
                             orig_name: f.name.slice(0, 200), orig_width: img.width, orig_height: img.height, orig_bytes: f.size });
       n++;
@@ -884,6 +892,318 @@ function viewPassword() {
       location.hash = "#/";
     } catch (err) { if (err.message) toast(err.message, "error"); }
   };
+}
+
+// =====================================================================
+// 2단계 (93_engwork2.sql): 업무일지 · 하루 전체 · 월간 현황 · 주간계획 · 주간미팅 · 결재란 · 엑셀
+// =====================================================================
+const OUTCOMES = ["달성", "부분", "미달"];
+const WDAYS = "월화수목금토";
+function ymd(dt0) { return `${dt0.getFullYear()}-${String(dt0.getMonth() + 1).padStart(2, "0")}-${String(dt0.getDate()).padStart(2, "0")}`; }
+function addDays(s, n) { const x = new Date(d(s) + "T00:00:00"); x.setDate(x.getDate() + n); return ymd(x); }
+function monday(s) { const x = new Date(d(s) + "T00:00:00"); x.setDate(x.getDate() - ((x.getDay() + 6) % 7)); return ymd(x); }
+const outBadge = (o) => (o ? `<span class="badge ${o === "달성" ? "st-완료" : o === "부분" ? "al-soon" : "al-overdue"}">${esc(o)}</span>` : "");
+const lineItem = (l) => (l.item_no ? `<b>${esc(l.item_no)}</b> ${esc(l.item_title || "")}` : "기타");
+
+// 결재란: flow = 결재 라인, signs = {user_id: {signed_at, signed_by, signer_name}}
+function signbox(flow, signs, type, docId) {
+  return `<div class="sign">${flow.map((u) => {
+    const s = signs[String(u.id)];
+    let body;
+    if (s) {
+      body = `<span class="ok">${esc(u.name)}</span><small>${md(s.signed_at)} ${String(s.signed_at).slice(11, 16)}${s.signed_by !== u.id ? ` 대리(${esc(s.signer_name)})` : ""}</small>
+        ${docId && ([u.id, s.signed_by].includes(me().id) || isAdmin()) ? `<button class="noprint" style="border:none;color:#888;padding:0" data-sign="${u.id}" data-cancel="1">취소</button>` : ""}`;
+    } else if (docId && (me().id === u.id || (canManage() && ["member", "coordinator"].includes(u.role)))) {
+      body = `<span class="muted small">${esc(u.name)}</span><button class="noprint" data-sign="${u.id}">${me().id === u.id ? "확인" : "대리 확인"}</button>`;
+    } else {
+      body = `<span class="muted small">${esc(u.name)}</span>`;
+    }
+    return `<div class="slot"><div class="h">${esc(u.position || u.name)}</div><div class="b">${body}</div></div>`;
+  }).join("")}</div>`;
+}
+function bindSign(type, docId) {
+  document.querySelectorAll("[data-sign]").forEach((b) => {
+    b.onclick = () => act("sign", { doc_type: b.closest("[data-doc-type]") ? b.closest("[data-doc-type]").dataset.docType : type,
+                                    doc_id: b.closest("[data-doc-id]") ? Number(b.closest("[data-doc-id]").dataset.docId) : docId,
+                                    slot: Number(b.dataset.sign), action: b.dataset.cancel ? "cancel" : "" },
+                       { confirm: b.dataset.cancel ? "확인을 취소할까요?" : null });
+  });
+}
+
+function itemSelect(name, choices, who, sel) {
+  const mine = choices.filter((c) => c.owner_id === who.id), sup = choices.filter((c) => c.support_id === who.id && c.owner_id !== who.id);
+  const rest = choices.filter((c) => !mine.includes(c) && !sup.includes(c));
+  const o = (list) => list.map((c) => `<option value="${c.id}" ${c.id === sel ? "selected" : ""}>${esc(c.item_no)} ${esc(c.title)}</option>`).join("");
+  return `<select name="${name}"><option value="">(기타 · 등록 안 된 일)</option>
+    ${mine.length ? `<optgroup label="${esc(who.name)} 담당">${o(mine)}</optgroup>` : ""}${sup.length ? `<optgroup label="협업">${o(sup)}</optgroup>` : ""}
+    <optgroup label="기타 진행 업무">${o(rest)}</optgroup></select>`;
+}
+function whoSelect(workers, who) {
+  if (!workers.some((w) => w.id === who.id)) workers = [who, ...workers];
+  return `<select id="sel-who" style="width:auto">${workers.map((w) => `<option value="${w.id}" ${w.id === who.id ? "selected" : ""}>${esc(w.name)} (${esc(w.position || "")})</option>`).join("")}</select>`;
+}
+
+// ── 업무일지 ────────────────────────────────────────────────────────
+async function viewDaily(q) {
+  const r = await api("daily_get", { user_id: q.get("user") || null, date: q.get("date") || null });
+  const who = r.who, dd = r.date, ed = r.editable, dl = r.daily;
+  const go = (u, dt0) => { location.hash = `#/daily?user=${u}&date=${dt0}`; };
+  const doneRow = (l, i) => `<tr class="${l && r.carried && !dl ? "carry" : ""}"><td class="no">${i + 1}</td>
+    <td class="w-item" data-l="업무">${itemSelect("r_item", r.choices, who, l ? l.item_id : null)}</td>
+    <td data-l="한 일"><textarea name="r_content" placeholder="오늘 한 일 (결과 위주로)">${esc(l ? l.content : "")}</textarea></td>
+    <td class="w-h" data-l="시간(h)"><input type="number" name="r_hours" min="0" max="24" step="0.5" value="${l && l.hours !== null && l.hours !== undefined ? hrs(l.hours) : ""}" placeholder="h"></td>
+    <td class="w-p" data-l="진행률 갱신(%)"><input type="number" name="r_progress" min="0" max="100" step="5" value="${l && l.progress !== null && l.progress !== undefined ? l.progress : ""}" placeholder="%"></td>
+    <td class="w-ph" data-l="현장 사진 (업무 선택 시)"><label class="fu-f" title="현장 사진 — 고른 업무의 '작업 중' 사진으로 저장">📷<input type="file" name="r_photo" accept="image/*" multiple></label></td></tr>`;
+  const planRow = (l, i) => `<tr><td class="no">${i + 1}</td><td class="w-item" data-l="업무">${itemSelect("p_item", r.choices, who, l ? l.item_id : null)}</td>
+    <td data-l="할 일"><textarea name="p_content" placeholder="내일 할 일">${esc(l ? l.content : "")}</textarea></td></tr>`;
+  const fill = (list) => list.concat(Array(list.length ? 2 : 3).fill(null));            // EngWork: 있는 줄 + 빈 줄 2 (없으면 3)
+  $main.innerHTML = `
+  <div class="card doc"><div class="doc-head"><div>
+    <div class="doc-title">일 일 업 무 일 지</div>
+    <div class="doc-meta"><div class="noprint" style="display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap">
+      <button class="btn sm light" id="d-prev">◀</button><input type="date" id="d-date" value="${dd}" style="width:150px"><button class="btn sm light" id="d-next">▶</button>
+      ${whoSelect(r.workers, who)}</div>
+      <div style="margin-top:6px"><b>${dd} (${wd(dd)})</b> · 성명 <b>${esc(who.name)}</b> ${esc(who.position || "")}
+        ${dl ? `· <span class="muted small">저장 ${dt(dl.updated_at)}${dl.written_by !== who.id ? ` (대리 작성 ${esc(dl.writer || "")})` : ""}</span>` : '· <span class="badge al-overdue">미작성</span>'}</div></div></div>
+    ${signbox(r.flow, r.signs, "daily", dl ? dl.id : null)}</div>
+  ${ed ? `<form id="f-daily">
+    <div class="sec-title">1. 금일 실적 <span class="sub">업무를 고르면 그 업무의 진행 내역에 쌓입니다 · 진행률을 적으면 업무 진행률도 바뀝니다 · 📷 = 현장 사진
+      ${r.carried && !dl ? '<br><span class="badge al-soon">지난 일지의 \'명일 계획\'을 불러왔습니다 — 실제 한 일로 고치세요</span>' : ""}</span></div>
+    <table class="rows fixed"><thead><tr><th style="width:36px">No</th><th style="width:30%">업무</th><th>한 일</th><th style="width:72px">시간(h)</th><th style="width:80px">진행률</th><th style="width:54px">사진</th></tr></thead>
+      <tbody id="done">${fill(r.done).map(doneRow).join("")}</tbody></table>
+    ${r.photos.length ? `<div class="small muted" style="margin-top:6px">이 일지에서 올린 사진</div>${thumbs(r.photos.map((p) => ({ ...p, kind: p.kind })))}` : ""}
+    <button type="button" class="btn sm light rowbtn noprint" id="add-done">+ 줄 추가</button>
+    <div class="sec-title">2. 명일 계획</div>
+    <table class="rows fixed"><thead><tr><th style="width:36px">No</th><th style="width:30%">업무</th><th>할 일</th></tr></thead><tbody id="plan">${fill(r.plan).map(planRow).join("")}</tbody></table>
+    <button type="button" class="btn sm light rowbtn noprint" id="add-plan">+ 줄 추가</button>
+    <div class="sec-title">3. 특이사항 · 지원 요청</div>
+    <div class="form-grid"><div class="w2"><label>특이사항 · 이슈</label><textarea name="issues" placeholder="설비 이상, 안전, 일정 지연 사유 등">${esc(dl ? dl.issues || "" : "")}</textarea></div>
+      <div class="w2"><label>지원·협조 요청</label><textarea name="support_request" placeholder="필요한 결정, 구매, 인력 지원 등">${esc(dl ? dl.support_request || "" : "")}</textarea></div></div>
+    <p class="actions noprint" style="margin-top:14px"><button class="btn">저장</button><button type="button" class="btn light" onclick="window.print()">인쇄</button>
+      <a class="btn light" href="#/daily/report?date=${dd}">이 날 전체 일지</a><a class="btn light" href="#/daily/month?m=${dd.slice(0, 7)}">월간 작성 현황</a></p>
+    <div class="prog" id="d-prog"></div></form>`
+    : `<div class="sec-title">1. 금일 실적</div><table class="rows ro"><thead><tr><th>No</th><th>업무</th><th>한 일</th><th>시간</th><th>진행률</th></tr></thead><tbody>
+      ${dl && r.done.length ? r.done.map((l, i) => `<tr><td class="no">${i + 1}</td><td>${lineItem(l)}</td><td class="pre">${esc(l.content)}</td><td class="c">${l.hours ? hrs(l.hours) : ""}</td>
+        <td class="c">${l.progress !== null && l.progress !== undefined ? l.progress + "%" : ""}</td></tr>`).join("") : '<tr><td colspan="5" class="muted">작성된 실적이 없습니다.</td></tr>'}</tbody></table>
+      <div class="sec-title">2. 명일 계획</div><table class="rows ro"><tbody>${r.plan.map((l, i) => `<tr><td class="no">${i + 1}</td><td>${lineItem(l)}</td><td class="pre">${esc(l.content)}</td></tr>`).join("")
+        || '<tr><td class="muted">없음</td></tr>'}</tbody></table>
+      ${dl ? `<div class="sec-title">3. 특이사항 · 지원 요청</div><div class="pre">${esc(dl.issues || "-")}</div><div class="pre">${esc(dl.support_request || "")}</div>` : ""}
+      ${r.photos.length ? thumbs(r.photos) : ""}
+      <p class="noprint"><a class="btn light" href="#/daily/report?date=${dd}">이 날 전체 일지</a> <button class="btn light" onclick="window.print()">인쇄</button></p>`}
+  </div>`;
+  document.getElementById("d-prev").onclick = () => go(who.id, addDays(dd, -1));
+  document.getElementById("d-next").onclick = () => go(who.id, addDays(dd, 1));
+  document.getElementById("d-date").onchange = (e) => go(who.id, e.target.value || dd);
+  document.getElementById("sel-who").onchange = (e) => go(e.target.value, dd);
+  bindSign("daily", dl ? dl.id : null);
+  bindBig();
+  const fm = document.getElementById("f-daily");
+  if (!fm) return;
+  const renum = (tb) => tb.querySelectorAll("tr").forEach((tr, i) => { tr.querySelector("td.no").textContent = i + 1; });
+  document.getElementById("add-done").onclick = () => { const tb = document.getElementById("done"); tb.insertAdjacentHTML("beforeend", doneRow(null, 0)); renum(tb); bindFiles(); };
+  document.getElementById("add-plan").onclick = () => { const tb = document.getElementById("plan"); tb.insertAdjacentHTML("beforeend", planRow(null, 0)); renum(tb); };
+  const bindFiles = () => fm.querySelectorAll('input[name="r_photo"]').forEach((x) => { x.onchange = () => x.parentNode.setAttribute("data-n", x.files.length); });
+  bindFiles();
+  fm.onsubmit = async (e) => {
+    e.preventDefault();
+    const done = [...document.querySelectorAll("#done tr")].map((tr) => ({
+      item_id: tr.querySelector('[name="r_item"]').value || null, content: tr.querySelector('[name="r_content"]').value,
+      hours: tr.querySelector('[name="r_hours"]').value, progress: tr.querySelector('[name="r_progress"]').value,
+      files: tr.querySelector('[name="r_photo"]').files }));
+    const bad = done.findIndex((x) => x.files.length && !x.item_id);
+    if (bad >= 0) { toast(`${bad + 1}번째 줄: 사진은 업무를 고른 줄에만 붙일 수 있습니다.`, "error"); return; }
+    const plan = [...document.querySelectorAll("#plan tr")].map((tr) => ({ item_id: tr.querySelector('[name="p_item"]').value || null,
+                                                                          content: tr.querySelector('[name="p_content"]').value }));
+    const btn = fm.querySelector("button.btn");
+    btn.disabled = true;
+    try {
+      const r2 = await api("daily_save", { user_id: who.id, work_date: dd, issues: fm.issues.value, support_request: fm.support_request.value,
+                                           done: done.map(({ files, ...x }) => x), plan });
+      let n = 0;
+      const errs = [];
+      for (const x of done.filter((y) => y.files.length && y.item_id)) {
+        const up = await uploadPhotos(Number(x.item_id), x.files, { daily_id: r2.daily_id, kind: "작업중", caption: (x.content || "").slice(0, 200), taken_date: dd },
+                                      document.getElementById("d-prog"));
+        n += up.n; errs.push(...up.errs);
+      }
+      toast(r2.msg + (n ? ` · 사진 ${n}장` : ""));
+      if (errs.length) setTimeout(() => toast(errs.join(" / "), "error"), 1500);
+      await route();
+    } catch (err) { if (err.message) toast(err.message, "error"); btn.disabled = false; }
+  };
+}
+
+async function viewDailyReport(q) {
+  const r = await api("daily_report", { date: q.get("date") || null });
+  const dd = r.date;
+  $main.innerHTML = `<div class="actions noprint" style="margin-bottom:10px">
+      <a class="btn sm light" href="#/daily/report?date=${addDays(dd, -1)}">◀</a><b style="font-size:16px">${dd} (${wd(dd)}) 업무일지 전체</b>
+      <a class="btn sm light" href="#/daily/report?date=${addDays(dd, 1)}">▶</a><button class="btn sm light" onclick="window.print()">인쇄 / PDF</button>
+      <a class="btn sm light" href="#/daily/month?m=${dd.slice(0, 7)}">월간 현황</a></div>
+    ${r.docs.map((x) => `<div class="card doc" data-doc-type="daily" data-doc-id="${x.daily ? x.daily.id : ""}"><div class="doc-head"><div>
+        <div class="doc-title">일 일 업 무 일 지</div>
+        <div class="doc-meta"><b>${dd} (${wd(dd)})</b> · 성명 <b>${esc(x.who.name)}</b> ${esc(x.who.position || "")} · 실적 ${hrs(x.hours)}시간
+          ${x.daily ? (x.daily.written_by !== x.who.id ? ` <span class="muted small">(대리 작성 ${esc(x.daily.writer || "")})</span>` : "") : ' <span class="badge al-overdue">미작성</span>'}
+          <a class="noprint small" href="#/daily?user=${x.who.id}&date=${dd}">열기 →</a></div></div>
+        ${signbox(r.flow, x.signs, "daily", x.daily ? x.daily.id : null)}</div>
+      <div class="sec-title">1. 금일 실적</div><table class="rows ro"><tbody>${x.done.map((l, i) => `<tr><td class="no">${i + 1}</td><td>${lineItem(l)}</td><td class="pre">${esc(l.content)}</td>
+        <td class="c">${l.hours ? hrs(l.hours) + "h" : ""}</td><td class="c">${l.progress !== null && l.progress !== undefined ? l.progress + "%" : ""}</td></tr>`).join("") || '<tr><td class="muted">없음</td></tr>'}</tbody></table>
+      <div class="sec-title">2. 명일 계획</div><table class="rows ro"><tbody>${x.plan.map((l, i) => `<tr><td class="no">${i + 1}</td><td>${lineItem(l)}</td><td class="pre">${esc(l.content)}</td></tr>`).join("")
+        || '<tr><td class="muted">없음</td></tr>'}</tbody></table>
+      ${x.daily && (x.daily.issues || x.daily.support_request) ? `<div class="sec-title">3. 특이사항 · 지원 요청</div><div class="pre">${esc(x.daily.issues || "")}</div><div class="pre">${esc(x.daily.support_request || "")}</div>` : ""}
+    </div>`).join("") || '<div class="card muted">일지 대상자가 없습니다 (관리 > 사용자에서 결재 순서).</div>'}`;
+  bindSign("daily", null);
+}
+
+async function viewDailyMonth(q) {
+  const r = await api("daily_month", { m: q.get("m") || "" });
+  const days = [];
+  for (let x = r.first; x <= r.last; x = addDays(x, 1)) days.push(x);
+  const m = r.first.slice(0, 7), prev = addDays(r.first, -1).slice(0, 7), next = addDays(r.last, 1).slice(0, 7);
+  $main.innerHTML = `<h1>업무일지 월간 현황 <span class="sub">실적 건수 · 시간 · 결재 확인 수</span></h1>
+    <div class="actions" style="margin-bottom:10px"><a class="btn sm light" href="#/daily/month?m=${prev}">◀</a><b style="font-size:16px">${m.replace("-", "년 ")}월</b>
+      <a class="btn sm light" href="#/daily/month?m=${next}">▶</a></div>
+    <div class="card" style="padding:0"><div class="tablewrap"><table class="t"><thead><tr><th>일자</th>${r.workers.map((w) => `<th>${esc(w.name)}</th>`).join("")}<th>전체</th></tr></thead><tbody>
+    ${days.map((dy) => { const we = [0, 6].includes(new Date(dy + "T00:00:00").getDay());
+      return `<tr style="${we ? "background:#f6f6f6" : ""}"><td class="c ${we ? "muted" : ""}">${md(dy)} (${wd(dy)})</td>
+        ${r.workers.map((w) => { const c = r.cells[`${w.id}|${dy}`];
+          return `<td class="c">${c ? `<a href="#/daily?user=${w.id}&date=${dy}">${c.n_done}건 · ${hrs(c.hours)}h</a> <span class="small ${c.n_sign < r.n_flow ? "muted" : ""}" title="결재 확인">✔${c.n_sign}/${r.n_flow}</span>`
+            : !we && dy <= B.today ? `<a href="#/daily?user=${w.id}&date=${dy}" class="badge al-overdue">미작성</a>` : '<span class="muted">-</span>'}</td>`; }).join("")}
+        <td class="c"><a href="#/daily/report?date=${dy}">보기</a></td></tr>`; }).join("")}</tbody></table></div></div>`;
+}
+
+// ── 주간계획 ────────────────────────────────────────────────────────
+async function viewWeekly(q) {
+  const r = await api("weekly_get", { user_id: q.get("user") || null, week: q.get("week") || null });
+  const who = r.who, ws = r.week_start, w = r.weekly, ed = r.editable;
+  const go = (u, x) => { location.hash = `#/weekly?user=${u}&week=${x}`; };
+  const row = (l) => `<tr class="${l && l.carry ? "carry" : ""}"><td class="w-item" data-l="업무">${itemSelect("w_item", r.choices, who, l ? l.item_id : null)}</td>
+    <td data-l="이번 주 목표"><textarea name="w_goal" placeholder="이번 주 목표">${esc(l ? l.goal : "")}</textarea></td>
+    <td class="w-days days" data-l="계획 요일">${WDAYS.split("").map((c) => `<label><input type="checkbox" value="${c}" ${l && (l.days || "").includes(c) ? "checked" : ""}>${c}</label>`).join("")}</td>
+    <td data-l="실적 (금요일)"><textarea name="w_result" placeholder="실적">${esc(l ? l.result || "" : "")}</textarea></td>
+    <td class="w-out" data-l="평가"><select name="w_outcome">${opts(OUTCOMES.map((o) => ({ v: o, t: o })), l ? l.outcome : "", "-")}</select></td></tr>`;
+  const lines = r.lines.length ? r.lines : [null, null, null];
+  $main.innerHTML = `
+  <div class="card doc"><div class="doc-head"><div>
+    <div class="doc-title">주 간 업 무 계 획</div>
+    <div class="doc-meta"><div class="noprint" style="display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap">
+      <button class="btn sm light" id="w-prev">◀ 지난주</button><input type="date" id="w-date" value="${ws}" style="width:150px"><button class="btn sm light" id="w-next">다음 주 ▶</button>
+      ${whoSelect(r.workers, who)}</div>
+      <div style="margin-top:6px"><b>${ws} (월) ~ ${r.week_end} (금)</b> · 성명 <b>${esc(who.name)}</b> ${esc(who.position || "")}
+        ${w ? `· <span class="muted small">저장 ${dt(w.updated_at)}${w.written_by !== who.id ? ` (대리 작성 ${esc(w.writer || "")})` : ""}</span>` : '· <span class="badge al-overdue">미작성</span>'}
+        ${r.drafted ? '<br><span class="badge al-soon">초안: 지난주 부분·미달 이월 (노란 줄) + 담당 진행 업무 — 고쳐서 저장하세요</span>' : ""}</div></div></div>
+    ${signbox(r.flow, r.signs, "weekly", w ? w.id : null)}</div>
+  <form id="f-weekly">
+    <table class="rows fixed"><thead><tr><th style="width:24%">업무</th><th>이번 주 목표</th><th style="width:230px">계획 요일</th><th>실적 (금요일)</th><th style="width:90px">평가</th></tr></thead>
+      <tbody id="wl">${lines.map(row).join("")}</tbody></table>
+    ${ed ? '<button type="button" class="btn sm light rowbtn noprint" id="add-w">+ 줄 추가</button>' : ""}
+    <div class="form-grid" style="margin-top:12px">
+      <div class="w2"><label>주간 이슈 · 지원 요청</label><textarea name="issues" ${ed ? "" : "disabled"}>${esc(w ? w.issues || "" : "")}</textarea></div>
+      <div class="w2"><label>결정권자 코멘트</label><textarea name="director_comment" ${r.director ? "" : "disabled"} placeholder="${r.director ? "결정권자 의견" : ""}">${esc(w ? w.director_comment || "" : "")}</textarea></div></div>
+    ${ed || r.director ? `<p class="actions noprint" style="margin-top:14px"><button class="btn">${ed ? "저장" : "코멘트 저장"}</button>
+      <button type="button" class="btn light" onclick="window.print()">인쇄</button><a class="btn light" href="#/meeting?week=${ws}">주간미팅</a></p>` : ""}
+  </form>
+  ${r.work.length ? `<div class="sec-title">이번 주 업무일지 실적 (참고)</div><table class="rows ro"><tbody>${r.work.map((x) => `<tr><td class="c">${md(x.work_date)} (${wd(x.work_date)})</td>
+    <td>${x.item_no ? `<b>${esc(x.item_no)}</b>` : "기타"}</td><td class="pre">${esc(x.content)}</td><td class="c">${x.hours ? hrs(x.hours) + "h" : ""}</td></tr>`).join("")}</tbody></table>` : ""}
+  </div>`;
+  if (!ed) document.querySelectorAll("#wl select, #wl textarea, #wl input").forEach((x) => { x.disabled = true; });
+  document.getElementById("w-prev").onclick = () => go(who.id, addDays(ws, -7));
+  document.getElementById("w-next").onclick = () => go(who.id, addDays(ws, 7));
+  document.getElementById("w-date").onchange = (e) => go(who.id, monday(e.target.value || ws));
+  document.getElementById("sel-who").onchange = (e) => go(e.target.value, ws);
+  bindSign("weekly", w ? w.id : null);
+  const add = document.getElementById("add-w");
+  if (add) add.onclick = () => document.getElementById("wl").insertAdjacentHTML("beforeend", row(null));
+  document.getElementById("f-weekly").onsubmit = async (e) => {
+    e.preventDefault();
+    const fm = e.target;
+    const ls = [...document.querySelectorAll("#wl tr")].map((tr) => ({
+      item_id: tr.querySelector('[name="w_item"]').value || null, goal: tr.querySelector('[name="w_goal"]').value,
+      days: [...tr.querySelectorAll(".days input:checked")].map((x) => x.value).join(""),
+      result: tr.querySelector('[name="w_result"]').value, outcome: tr.querySelector('[name="w_outcome"]').value }));
+    await act("weekly_save", { user_id: who.id, week_start: ws, issues: fm.issues.value, director_comment: fm.director_comment.value, lines: ed ? ls : [] });
+  };
+}
+
+// ── 주간미팅 ────────────────────────────────────────────────────────
+async function viewMeeting(q) {
+  const r = await api("meeting", { week: q.get("week") || null });
+  const ws = r.week_start, items = r.items;
+  const und = items.filter((t) => t.priority === null), appr = items.filter((t) => t.status === "검토요청");
+  const dueWeek = items.filter((t) => t.due_date && t.due_date >= ws && t.due_date <= addDays(ws, 6));
+  const time = r.meeting.includes(" ") ? r.meeting.split(" ").slice(-1)[0] : "";
+  $main.innerHTML = `
+  <div class="actions noprint" style="margin-bottom:10px"><a class="btn sm light" href="#/meeting?week=${addDays(ws, -7)}">◀ 지난주</a>
+    <b style="font-size:16px">주간 미팅 자료 — ${ws} (월) ${esc(time)}</b><a class="btn sm light" href="#/meeting?week=${addDays(ws, 7)}">다음 주 ▶</a>
+    <button class="btn sm light" onclick="window.print()">인쇄 / PDF</button><button class="btn sm" id="b-mxls">엑셀</button></div>
+  <div class="card"><h2>1. 결정할 것</h2><div class="grid2">
+    <div><b>우선순위 미확정 ${und.length}건</b> <a class="small noprint" href="#/priority">결정하러 가기 →</a>
+      <ul class="small">${und.map((t) => `<li>${prio(t)} <a href="#/item/${t.id}">${esc(t.item_no)}</a> ${esc(t.title)} — ${esc(t.owner_name || "")}</li>`).join("") || '<li class="muted">없음</li>'}</ul></div>
+    <div><b>완료 승인 대기 ${appr.length}건</b>
+      <ul class="small">${appr.map((t) => `<li><a href="#/item/${t.id}">${esc(t.item_no)} ${esc(t.title)}</a> — ${esc(t.owner_name || "")}</li>`).join("") || '<li class="muted">없음</li>'}</ul></div></div></div>
+  <div class="card"><h2>2. 사람별 지난주 실적 · 이번 주 계획</h2>
+    ${r.people.map((p) => { const rate = OUTCOMES.map((o) => `${o} ${p.last.filter((l) => l.outcome === o).length}`).join(" / ");
+      return `<div class="sec-title">${esc(p.who.name)} <span class="sub">${esc(p.who.position || "")} · 지난주 일지 ${hrs(p.last_hours)}시간 · 평가 ${rate}
+          · <a class="noprint" href="#/weekly?user=${p.who.id}&week=${ws}">이번 주 계획 ${p.cur_doc ? "보기" : "작성"} →</a></span></div>
+        <div class="grid2"><table class="rows ro"><thead><tr><th>지난주 목표</th><th>실적</th><th>평가</th></tr></thead><tbody>
+          ${p.last.map((l) => `<tr><td>${l.item_no ? `<b>${esc(l.item_no)}</b> ` : ""}${esc(l.goal)}</td><td class="pre">${esc(l.result || "")}</td><td class="c">${outBadge(l.outcome)}</td></tr>`).join("")
+            || '<tr><td colspan="3" class="muted">지난주 계획 없음</td></tr>'}</tbody></table>
+          <table class="rows ro"><thead><tr><th>이번 주 목표</th><th>요일</th></tr></thead><tbody>
+          ${p.cur.map((l) => `<tr><td>${l.item_no ? `<b>${esc(l.item_no)}</b> ` : ""}${esc(l.goal)}</td><td class="c">${esc(l.days || "")}</td></tr>`).join("")
+            || '<tr><td colspan="2" class="muted">이번 주 계획 미작성</td></tr>'}</tbody></table></div>
+        ${p.last_comment ? `<div class="small" style="margin-top:4px"><b>지난주 결정권자 코멘트:</b> ${esc(p.last_comment)}</div>` : ""}`; }).join("") || '<p class="muted">대상자 없음</p>'}</div>
+  <div class="card"><h2>3. 진행 중 업무 (우선순위 순) <span class="sub">${items.length}건 · 이번 주 마감 ${dueWeek.length}건 · 지난주 완료 ${r.done_last.length}건</span></h2>
+    <div class="tablewrap"><table class="t"><thead><tr><th>우선</th><th>업무</th><th>요청</th><th>담당</th><th>상태</th><th>진행률</th><th>알림</th><th>다음 조치</th><th>기한</th></tr></thead>
+      <tbody>${items.map((t) => `<tr><td class="c">${prio(t)}</td><td class="title">${tlink(t)} ${esc(t.title)}</td><td class="c">${esc(t.requester_name || "")}</td>
+        <td class="c">${esc(t.owner_name || "")}</td><td class="c">${stBadge(t.status)}</td><td>${bar(t.progress)}</td><td class="c">${alBadge(t)}</td>
+        <td class="clip small">${esc(t.next_action || "")}</td><td class="c">${d(t.due_date)}</td></tr>`).join("") || '<tr><td colspan="9" class="muted c">진행 중 업무 없음</td></tr>'}</tbody></table></div>
+    ${r.done_last.length ? `<p class="small"><b>지난주 완료:</b> ${r.done_last.map((t) => `${esc(t.item_no)} ${esc(t.title)} (${esc(t.owner_name || "")})`).join(", ")}</p>` : ""}</div>`;
+  document.getElementById("b-mxls").onclick = () => {
+    const wk = [];
+    r.people.forEach((p) => {
+      p.last.forEach((l) => wk.push([p.who.name, "지난주", l.item_no || "", l.goal, l.days || "", l.result || "", l.outcome || ""]));
+      p.cur.forEach((l) => wk.push([p.who.name, "이번 주", l.item_no || "", l.goal, l.days || "", "", ""]));
+    });
+    saveXlsx(`주간미팅_${ws.replace(/-/g, "")}.xlsx`, [
+      { name: "업무현황(우선순위순)", head: ITEM_HEAD, rows: itemRows(items), widths: ITEM_W },
+      { name: "주간계획·실적", head: ["담당", "주차", "업무번호", "목표", "요일", "실적", "평가"], rows: wk, widths: [9, 8, 9, 44, 10, 40, 7] },
+      { name: "지난주 업무일지", head: ["일자", "담당", "구분", "업무번호", "내용", "시간(h)", "진행률"],
+        rows: r.daily_last.map((l) => [d(l.work_date), l.name, l.section === "실적" ? "금일 실적" : "명일 계획", l.item_no || "", l.content,
+                                       l.hours !== null ? Number(l.hours) : "", l.progress ?? ""]), widths: [11, 8, 9, 9, 60, 8, 7] }]);
+  };
+}
+
+// ── 엑셀 (SheetJS — 누를 때만 받아 옴) ───────────────────────────────
+const ITEM_HEAD = ["업무번호", "업무명", "구분", "현장·설비", "요청자", "담당", "협업", "우선순위", "상태", "진행률(%)",
+                   "완료 기한", "알림", "다음 조치", "다음 F/U일", "누적 투입(h)", "과제 번호", "사진", "단계"];
+const ITEM_W = [9, 36, 13, 12, 8, 8, 8, 11, 8, 8, 11, 12, 30, 11, 9, 9, 6, 7];
+function itemRows(items) {
+  return items.map((t) => [t.item_no, t.title, t.category || "", t.location || "", t.requester_name || "", t.owner_name || "", t.support_name || "",
+    t.prio_value ? `P${t.prio_value}${t.priority === null ? " (제안)" : ""}` : "", t.status, t.progress, d(t.due_date), t.alert_label || "",
+    t.next_action || "", d(t.next_action_due), Number(t.total_hours || 0), t.project_ref || "", t.photo_cnt, t.step_total ? `${t.step_done}/${t.step_total}` : ""]);
+}
+function loadXlsx() {
+  if (window.XLSX) return Promise.resolve(window.XLSX);
+  return new Promise((ok, no) => {
+    const s = document.createElement("script");
+    s.src = "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js";
+    s.onload = () => ok(window.XLSX);
+    s.onerror = () => no(new Error("엑셀 도구를 받지 못했습니다 — 인터넷 연결을 확인하세요."));
+    document.head.appendChild(s);
+  });
+}
+async function saveXlsx(name, sheets) {
+  try {
+    const X = await loadXlsx();
+    const wb = X.utils.book_new();
+    sheets.forEach((sh) => {
+      const ws = X.utils.aoa_to_sheet([sh.head, ...sh.rows]);
+      ws["!cols"] = sh.widths.map((w) => ({ wch: w }));
+      ws["!autofilter"] = { ref: ws["!ref"] };
+      X.utils.book_append_sheet(wb, ws, sh.name.slice(0, 31));
+    });
+    X.writeFile(wb, name);
+  } catch (e) { toast(e.message, "error"); }
 }
 
 start();
